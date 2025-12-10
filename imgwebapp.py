@@ -8,33 +8,81 @@ from PIL import Image
 import requests
 from io import BytesIO
 
-st.set_option('deprecation.showfileUploaderEncoding', False)
 st.title("Bean Image Classifier")
-st.text("Provide URL of bean Image for image classification")
+st.text("Provide URL of bean image for image classification")
 
-@st.cache(allow_output_mutation=True)
-def load_model():
-  model = tf.keras.models.load_model('/app/models/')
-  return model
+# Use cache_resource if available (Streamlit >= ~1.18); otherwise fall back to st.cache
+if hasattr(st, "cache_resource"):
+    cache_decorator = st.cache_resource
+else:
+    # older Streamlit versions
+    def cache_decorator(func=None, **kwargs):
+        if func is None:
+            return lambda f: st.cache(f, allow_output_mutation=True)
+        return st.cache(func, allow_output_mutation=True)
 
-with st.spinner('Loading Model Into Memory....'):
-  model = load_model()
+@cache_decorator
+def load_model(model_path="/app/models/"):
+    """Load and return the Keras model. Adjust model_path if different."""
+    try:
+        model = tf.keras.models.load_model(model_path)
+        return model
+    except Exception as e:
+        # re-raise so caller can handle and display a friendly message
+        raise RuntimeError(f"Failed to load model from {model_path}: {e}")
 
-classes=['angular_leaf_spot','bean_rust','healthy']
+with st.spinner("Loading model into memory..."):
+    try:
+        model = load_model()
+    except Exception as e:
+        st.error(f"Model load error: {e}")
+        st.stop()
 
-def decode_img(image):
-  img = tf.image.decode_jpeg(image, channels=3)  
-  img = tf.image.resize(img,[224,224])
-  return np.expand_dims(img, axis=0)
+classes = ["angular_leaf_spot", "bean_rust", "healthy"]
 
-path = st.text_input('Enter Image URL to Classify.. ','https://beanipm.pbgworks.org/sites/pbg-beanipm7/files/styles/picture_custom_user_wide_1x/public/AngularLeafSpotFig1a.jpg')
-if path is not None:
-    content = requests.get(path).content
+def decode_img(image_bytes):
+    """
+    Decode JPEG/PNG bytes into a batched float32 tensor,
+    resized to 224x224 and normalized to [0, 1].
+    """
+    # convert to tf tensor of type string
+    img_tensor = tf.io.decode_jpeg(image_bytes, channels=3)  # works for JPEG; PNG usually OK too
+    img_tensor = tf.image.resize(img_tensor, [224, 224])
+    img_tensor = tf.cast(img_tensor, tf.float32) / 255.0
+    img_tensor = tf.expand_dims(img_tensor, axis=0)  # batch dim
+    return img_tensor  # tf.Tensor with shape (1, 224, 224, 3)
 
-    st.write("Predicted Class :")
-    with st.spinner('classifying.....'):
-      label =np.argmax(model.predict(decode_img(content)),axis=1)
-      st.write(classes[label[0]])    
-    st.write("")
-    image = Image.open(BytesIO(content))
-    st.image(image, caption='Classifying Bean Image', use_column_width=True)
+# Default example image URL (you can change)
+default_url = "https://beanipm.pbgworks.org/sites/pbg-beanipm7/files/styles/picture_custom_user_wide_1x/public/AngularLeafSpotFig1a.jpg"
+path = st.text_input("Enter Image URL to classify:", default_url)
+
+if path:
+    # fetch image bytes
+    try:
+        resp = requests.get(path, timeout=10)
+        resp.raise_for_status()
+        content = resp.content
+    except requests.RequestException as e:
+        st.error(f"Failed to fetch image from URL: {e}")
+    else:
+        # show image preview
+        try:
+            image = Image.open(BytesIO(content)).convert("RGB")
+            st.image(image, caption="Input image", use_column_width=True)
+        except Exception as e:
+            st.warning(f"Could not render preview image (but bytes were fetched): {e}")
+
+        # run prediction
+        with st.spinner("Classifying..."):
+            try:
+                input_tensor = decode_img(content)               # tf.Tensor
+                preds = model.predict(input_tensor)              # returns numpy array or tensor
+                label_idx = int(np.argmax(preds, axis=1)[0])     # get index
+                st.write("Predicted class:")
+                st.success(classes[label_idx])
+                # optional: print probabilities
+                prob_list = preds[0].tolist()
+                for i, c in enumerate(classes):
+                    st.write(f"{c}: {prob_list[i]:.4f}")
+            except Exception as e:
+                st.error(f"Prediction failed: {e}")
